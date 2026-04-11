@@ -205,6 +205,9 @@ add_library(ggml-base
             ggml-threading.h
             ggml-quants.c
             ggml-quants.h
+            ggml-turboq.c
+            ggml-turboq.h
+            ggml-turboq-tables.h
             gguf.cpp)
 
 set_target_properties(ggml-base PROPERTIES
@@ -213,6 +216,15 @@ set_target_properties(ggml-base PROPERTIES
 )
 
 target_include_directories(ggml-base PRIVATE .)
+
+# Link Accelerate framework for TurboQuant cblas_sgemv on Apple Silicon
+if (APPLE)
+    find_library(ACCELERATE_FRAMEWORK Accelerate)
+    if (ACCELERATE_FRAMEWORK)
+        target_link_libraries(ggml-base PRIVATE ${ACCELERATE_FRAMEWORK})
+    endif()
+endif()
+
 if (GGML_BACKEND_DL)
     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)
 endif()
@@ -460,6 +472,7 @@ ggml_add_backend(zDNN)
 ggml_add_backend(OpenCL)
 ggml_add_backend(Hexagon)
 ggml_add_backend(ZenDNN)
+ggml_add_backend(OPENVINO)
 
 foreach (target ggml-base ggml)
     target_include_directories(${target} PUBLIC    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include> $<INSTALL_INTERFACE:include>)

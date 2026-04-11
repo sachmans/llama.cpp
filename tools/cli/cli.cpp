@@ -1,3 +1,4 @@
+#include "chat.h"
 #include "common.h"
 #include "arg.h"
 #include "console.h"
@@ -56,6 +57,8 @@ struct cli_context {
     std::vector<raw_buffer> input_files;
     task_params defaults;
     bool verbose_prompt;
+    int reasoning_budget = -1;
+    std::string reasoning_budget_message;
 
     // thread for showing "loading" animation
     std::atomic<bool> loading_show;
@@ -72,6 +75,8 @@ struct cli_context {
         // defaults.return_progress = true; // TODO: show progress
 
         verbose_prompt = params.verbose_prompt;
+        reasoning_budget = params.reasoning_budget;
+        reasoning_budget_message = params.reasoning_budget_message;
     }
 
     std::string generate_completion(result_timings & out_timings) {
@@ -92,6 +97,24 @@ struct cli_context {
             task.params.chat_parser_params.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
             if (!chat_params.parser.empty()) {
                 task.params.chat_parser_params.parser.load(chat_params.parser);
+            }
+
+            // reasoning budget sampler
+            if (!chat_params.thinking_end_tag.empty()) {
+                const llama_vocab * vocab = llama_model_get_vocab(
+                    llama_get_model(ctx_server.get_llama_context()));
+
+                task.params.sampling.reasoning_budget_tokens = reasoning_budget;
+                task.params.sampling.generation_prompt = chat_params.generation_prompt;
+
+                if (!chat_params.thinking_start_tag.empty()) {
+                    task.params.sampling.reasoning_budget_start =
+                        common_tokenize(vocab, chat_params.thinking_start_tag, false, true);
+                }
+                task.params.sampling.reasoning_budget_end =
+                    common_tokenize(vocab, chat_params.thinking_end_tag, false, true);
+                task.params.sampling.reasoning_budget_forced =
+                    common_tokenize(vocab, reasoning_budget_message + chat_params.thinking_end_tag, false, true);
             }
 
             rd.post_task({std::move(task)});
@@ -191,7 +214,9 @@ struct cli_context {
         inputs.use_jinja             = chat_params.use_jinja;
         inputs.parallel_tool_calls   = false;
         inputs.add_generation_prompt = true;
-        inputs.enable_thinking       = chat_params.enable_thinking;
+        inputs.reasoning_format      = COMMON_REASONING_FORMAT_DEEPSEEK;
+        inputs.force_pure_content    = chat_params.force_pure_content;
+        inputs.enable_thinking       = chat_params.enable_thinking ? common_chat_templates_support_enable_thinking(chat_params.tmpls.get()) : false;
 
         // Apply chat template to the list of messages
         return common_chat_templates_apply(chat_params.tmpls.get(), inputs);
@@ -199,10 +224,11 @@ struct cli_context {
 };
 
 // TODO?: Make this reusable, enums, docs
-static const std::array<const std::string, 6> cmds = {
+static const std::array<const std::string, 7> cmds = {
     "/audio ",
     "/clear",
     "/exit",
+    "/glob ",
     "/image ",
     "/read ",
     "/regen",
@@ -233,7 +259,7 @@ static std::vector<std::pair<std::string, size_t>> auto_completion_callback(std:
         }
     }
 
-    if (!cmd.empty() && line.length() >= cmd.length() && cursor_byte_pos >= cmd.length()) {
+    if (!cmd.empty() && cmd != "/glob " && line.length() >= cmd.length() && cursor_byte_pos >= cmd.length()) {
         const std::string path_prefix  = std::string(line.substr(cmd.length(), cursor_byte_pos - cmd.length()));
         const std::string path_postfix = std::string(line.substr(cursor_byte_pos));
         auto cur_dir = std::filesystem::current_path();
@@ -314,10 +340,14 @@ static std::vector<std::pair<std::string, size_t>> auto_completion_callback(std:
     return matches;
 }
 
+static constexpr size_t FILE_GLOB_MAX_RESULTS = 100;
+
 int main(int argc, char ** argv) {
     common_params params;
 
     params.verbosity = LOG_LEVEL_ERROR; // by default, less verbose logs
+
+    common_init();
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_CLI)) {
         return 1;
@@ -328,8 +358,6 @@ int main(int argc, char ** argv) {
         console::error("--no-conversation is not supported by llama-cli\n");
         console::error("please use llama-completion instead\n");
     }
-
-    common_init();
 
     // struct that contains llama context and inference
     cli_context ctx_cli(params);
@@ -405,7 +433,8 @@ int main(int argc, char ** argv) {
     console::log("  /exit or Ctrl+C     stop or exit\n");
     console::log("  /regen              regenerate the last response\n");
     console::log("  /clear              clear the chat history\n");
-    console::log("  /read               add a text file\n");
+    console::log("  /read <file>        add a text file\n");
+    console::log("  /glob <pattern>     add text files using globbing pattern\n");
     if (inf.has_inp_image) {
         console::log("  /image <file>       add an image file\n");
     }
@@ -416,6 +445,27 @@ int main(int argc, char ** argv) {
 
     // interactive loop
     std::string cur_msg;
+
+    auto add_text_file = [&](const std::string & fname) -> bool {
+        std::string marker = ctx_cli.load_input_file(fname, false);
+        if (marker.empty()) {
+            console::error("file does not exist or cannot be opened: '%s'\n", fname.c_str());
+            return false;
+        }
+        if (inf.fim_sep_token != LLAMA_TOKEN_NULL) {
+            cur_msg += common_token_to_piece(ctx_cli.ctx_server.get_llama_context(), inf.fim_sep_token, true);
+            cur_msg += fname;
+            cur_msg.push_back('\n');
+        } else {
+            cur_msg += "--- File: ";
+            cur_msg += fname;
+            cur_msg += " ---\n";
+        }
+        cur_msg += marker;
+        console::log("Loaded text from '%s'\n", fname.c_str());
+        return true;
+    };
+
     while (true) {
         std::string buffer;
         console::set_display(DISPLAY_TYPE_USER_INPUT);
@@ -500,22 +550,60 @@ int main(int argc, char ** argv) {
             continue;
         } else if (string_starts_with(buffer, "/read ")) {
             std::string fname = string_strip(buffer.substr(6));
-            std::string marker = ctx_cli.load_input_file(fname, false);
-            if (marker.empty()) {
-                console::error("file does not exist or cannot be opened: '%s'\n", fname.c_str());
-                continue;
+            add_text_file(fname);
+            continue;
+        } else if (string_starts_with(buffer, "/glob ")) {
+            std::error_code ec;
+            size_t count = 0;
+            auto curdir = std::filesystem::current_path();
+            std::string pattern = string_strip(buffer.substr(6));
+            std::filesystem::path rel_path;
+
+            auto startglob = pattern.find_first_of("![*?");
+            if (startglob != std::string::npos && startglob != 0) {
+                auto endpath = pattern.substr(0, startglob).find_last_of('/');
+                if (endpath != std::string::npos) {
+                    std::string rel_pattern = pattern.substr(0, endpath);
+#if !defined(_WIN32)
+                    if (string_starts_with(rel_pattern, "~")) {
+                        const char * home = std::getenv("HOME");
+                        if (home && home[0]) {
+                            rel_pattern = std::string(home) + rel_pattern.substr(1);
+                        }
+                    }
+#endif
+                    rel_path = rel_pattern;
+                    pattern.erase(0, endpath + 1);
+                    curdir /= rel_path;
+                }
             }
-            if (inf.fim_sep_token != LLAMA_TOKEN_NULL) {
-                cur_msg += common_token_to_piece(ctx_cli.ctx_server.get_llama_context(), inf.fim_sep_token, true);
-                cur_msg += fname;
-                cur_msg.push_back('\n');
-            } else {
-                cur_msg += "--- File: ";
-                cur_msg += fname;
-                cur_msg += " ---\n";
+
+            for (const auto & entry : std::filesystem::recursive_directory_iterator(curdir,
+                    std::filesystem::directory_options::skip_permission_denied, ec)) {
+                if (!entry.is_regular_file()) {
+                    continue;
+                }
+
+                std::string rel = std::filesystem::relative(entry.path(), curdir, ec).string();
+                if (ec) {
+                    ec.clear();
+                    continue;
+                }
+                std::replace(rel.begin(), rel.end(), '\\', '/');
+
+                if (!glob_match(pattern, rel)) {
+                    continue;
+                }
+
+                if (!add_text_file((rel_path / rel).string())) {
+                    continue;
+                }
+
+                if (++count >= FILE_GLOB_MAX_RESULTS) {
+                    console::error("Maximum number of globbed files allowed (%zu) reached.\n", FILE_GLOB_MAX_RESULTS);
+                    break;
+                }
             }
-            cur_msg += marker;
-            console::log("Loaded text from '%s'\n", fname.c_str());
             continue;
         } else {
             // not a command

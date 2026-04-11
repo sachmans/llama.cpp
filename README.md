@@ -17,6 +17,7 @@ LLM inference in C/C++
 
 ## Hot topics
 
+- **Hugging Face cache migration: models downloaded with `-hf` are now stored in the standard Hugging Face cache directory, enabling sharing with other HF tools.**
 - **[guide : using the new WebUI of llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/16938)**
 - [guide : running gpt-oss with llama.cpp](https://github.com/ggml-org/llama.cpp/discussions/15396)
 - [[FEEDBACK] Better packaging for llama.cpp to support downstream consumers 🤗](https://github.com/ggml-org/llama.cpp/discussions/15313)
@@ -26,6 +27,86 @@ LLM inference in C/C++
 - Vim/Neovim plugin for FIM completions: https://github.com/ggml-org/llama.vim
 - Hugging Face Inference Endpoints now support GGUF out of the box! https://github.com/ggml-org/llama.cpp/discussions/9669
 - Hugging Face GGUF editor: [discussion](https://github.com/ggml-org/llama.cpp/discussions/9268) | [tool](https://huggingface.co/spaces/CISCai/gguf-editor)
+
+----
+
+## TurboQuant KV Cache (This Fork)
+
+> **This fork extends [PR #21089](https://github.com/ggerganov/llama.cpp/pull/21089) (elusznik's CPU TurboQuant) with two optimizations that improve speed and quality.**
+
+TurboQuant compresses the KV cache using Householder rotation + Lloyd-Max codebooks, enabling **3.9–5.2× memory compression** with minimal quality loss. On a 96GB Mac Studio, Qwen3-32B goes from **278K → 1.45M token context**.
+
+### Benchmark: Quality (Perplexity)
+
+Qwen3-32B Q4_K_M, wikitext-2, Mac Studio M3 Ultra 96GB, `-ngl 99`, 8 chunks:
+
+| KV Type | Origin | PPL ↓ | vs F16 | Bits/elem | Compression |
+|---------|--------|-------|--------|-----------|-------------|
+| F16 | baseline | 5.798 | — | 16.00 | 1.0× |
+| Q8_0 | baseline | 5.797 | −0.01% | 8.50 | 1.9× |
+| Q4_0 | baseline | 5.857 | +1.0% | 4.50 | 3.6× |
+| **TBQ4_0** | **TurboQuant** | **5.872** | **+1.3%** | **4.06** | **3.9×** |
+| **TBQ3_0** | **TurboQuant** | **6.068** | **+4.7%** | **3.06** | **5.2×** |
+
+### Benchmark: Speed (Prompt Evaluation)
+
+| KV Type | Prompt Eval (t/s) | vs F16 | Notes |
+|---------|-------------------|--------|-------|
+| F16 | 278 | — | baseline |
+| Q8_0 | 269 | −3% | |
+| Q4_0 | 271 | −3% | |
+| **TBQ4_0** | **228** | **−18%** | Householder dequant overhead (CPU) |
+| **TBQ3_0** | **228** | **−18%** | same as TBQ4_0 |
+
+Speed overhead is due to the Householder matrix-vector multiply during dequantization, currently running on CPU via Apple Accelerate. A Metal SET_ROWS kernel would eliminate this penalty.
+
+### Benchmark: Max Context Length (96GB Mac Studio)
+
+| Model | Weights | F16 | Q4_0 | TBQ4_0 | TBQ3_0 |
+|-------|---------|-----|------|--------|--------|
+| Llama-3.1-8B (Q4_K_M) | ~5 GB | 696K | 2.47M | **2.74M** | **3.64M** |
+| Qwen3-32B (Q4_K_M) | ~19 GB | 278K | 988K | **1.10M** | **1.45M** |
+| Llama-3.3-70B (Q4_K_M) | ~40 GB | 164K | 583K | **646K** | **857K** |
+| Qwen2.5-72B (Q4_K_M) | ~43 GB | 154K | 548K | **606K** | **805K** |
+
+### Our Optimizations (On Top of PR #21089)
+
+1. **Apple Accelerate `cblas_sgemv`** (`95fb4fe`) — 2× faster dequant on M-series via AMX coprocessor
+2. **L2 norm correction** (`c2621e3`) — re-normalize unit vector after dequant, halves PPL gap vs F16
+
+### Experimental: QJL Error Correction
+
+See branch [`experimental/qjl-error-correction`](https://github.com/SeKondBrainAILabs/llama.cpp-turboquant/tree/experimental/qjl-error-correction) for TBQP4_0 and TBQP3_0 types that add 1-bit QJL (Quantized Johnson-Lindenstrauss) sign correction. Results: QJL reduces 2-bit PPL by 28%, but straight codebook types (TBQ3_0, TBQ4_0) remain more efficient at equivalent bit-rates.
+
+### Usage
+
+```bash
+cmake -B build -DGGML_METAL=ON
+cmake --build build -j
+
+# Perplexity benchmark
+./build/bin/llama-perplexity \
+    -hf bartowski/Qwen2.5-32B-Instruct-GGUF:Q4_K_M \
+    -f wiki.test.raw -ctk tbq4_0 -ctv tbq4_0 --chunks 8 -ngl 99
+
+# Server with mixed K/V (best quality/compression trade-off)
+./build/bin/llama-server \
+    -hf bartowski/Qwen2.5-32B-Instruct-GGUF:Q4_K_M \
+    -ctk tbq4_0 -ctv tbq3_0 --host 0.0.0.0 --port 8080 -ngl 99
+```
+
+### Known Limitations
+
+- **Speed**: 18% slower prompt eval due to CPU-based Householder dequant. Needs Metal kernel.
+- **CPU-only KV cache**: TBQ types require KV cache on CPU (no Metal SET_ROWS kernel yet).
+- **Model compatibility**: Qwen2.5-VL-7B broken with any KV quant below Q8_0 (upstream issue).
+
+### Roadmap
+
+- [ ] **Metal SET_ROWS kernel**: eliminate speed penalty by moving dequant to GPU
+- [ ] **Cross-architecture validation**: benchmark on Llama, Mistral, Gemma
+- [ ] **Needle-in-a-haystack eval**: verify retrieval quality at 500K+ tokens
+- [ ] **Upstream PR**: submit Accelerate + norm correction to PR #21089
 
 ----
 
@@ -241,7 +322,7 @@ Instructions for adding support for new models: [HOWTO-add-model.md](docs/develo
 <details>
 <summary>Tools</summary>
 
-- [akx/ggify](https://github.com/akx/ggify) – download PyTorch models from HuggingFace Hub and convert them to GGML
+- [akx/ggify](https://github.com/akx/ggify) – download PyTorch models from Hugging Face Hub and convert them to GGML
 - [akx/ollama-dl](https://github.com/akx/ollama-dl) – download models from the Ollama library to be used directly with llama.cpp
 - [crashr/gppm](https://github.com/crashr/gppm) – launch llama.cpp instances utilizing NVIDIA Tesla P40 or P100 GPUs with reduced idle power consumption
 - [gpustack/gguf-parser](https://github.com/gpustack/gguf-parser-go/tree/main/cmd/gguf-parser) - review/check the GGUF file and estimate the memory usage
@@ -259,6 +340,8 @@ Instructions for adding support for new models: [HOWTO-add-model.md](docs/develo
 - [llama-swap](https://github.com/mostlygeek/llama-swap) - transparent proxy that adds automatic model switching with llama-server
 - [Kalavai](https://github.com/kalavai-net/kalavai-client) - Crowdsource end to end LLM deployment at any scale
 - [llmaz](https://github.com/InftyAI/llmaz) - ☸️ Easy, advanced inference platform for large language models on Kubernetes.
+- [LLMKube](https://github.com/defilantech/llmkube) - Kubernetes operator for llama.cpp with multi-GPU and Apple Silicon Metal
+  support"
 </details>
 
 <details>
@@ -277,6 +360,7 @@ Instructions for adding support for new models: [HOWTO-add-model.md](docs/develo
 | [BLAS](docs/build.md#blas-build) | All |
 | [BLIS](docs/backend/BLIS.md) | All |
 | [SYCL](docs/backend/SYCL.md) | Intel and Nvidia GPU |
+| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
 | [MUSA](docs/build.md#musa) | Moore Threads GPU |
 | [CUDA](docs/build.md#cuda) | Nvidia GPU |
 | [HIP](docs/build.md#hip) | AMD GPU |
@@ -297,13 +381,13 @@ The [Hugging Face](https://huggingface.co) platform hosts a [number of LLMs](htt
 - [Trending](https://huggingface.co/models?library=gguf&sort=trending)
 - [LLaMA](https://huggingface.co/models?sort=trending&search=llama+gguf)
 
-You can either manually download the GGUF file or directly use any `llama.cpp`-compatible models from [Hugging Face](https://huggingface.co/) or other model hosting sites, such as [ModelScope](https://modelscope.cn/), by using this CLI argument: `-hf <user>/<model>[:quant]`. For example:
+You can either manually download the GGUF file or directly use any `llama.cpp`-compatible models from [Hugging Face](https://huggingface.co/) or other model hosting sites, by using this CLI argument: `-hf <user>/<model>[:quant]`. For example:
 
 ```sh
 llama-cli -hf ggml-org/gemma-3-1b-it-GGUF
 ```
 
-By default, the CLI would download from Hugging Face, you can switch to other options with the environment variable `MODEL_ENDPOINT`. For example, you may opt to downloading model checkpoints from ModelScope or other model sharing communities by setting the environment variable, e.g. `MODEL_ENDPOINT=https://www.modelscope.cn/`.
+By default, the CLI would download from Hugging Face, you can switch to other options with the environment variable `MODEL_ENDPOINT`. The `MODEL_ENDPOINT` must point to a Hugging Face compatible API endpoint.
 
 After downloading a model, use the CLI tools to run it locally - see below.
 
