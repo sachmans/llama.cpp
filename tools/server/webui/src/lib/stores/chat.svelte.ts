@@ -18,6 +18,7 @@ import { conversationsStore } from '$lib/stores/conversations.svelte';
 import { config } from '$lib/stores/settings.svelte';
 import { agenticStore } from '$lib/stores/agentic.svelte';
 import { mcpStore } from '$lib/stores/mcp.svelte';
+import { kemoryStore } from '$lib/stores/kemory.svelte';
 import { contextSize, isRouterMode } from '$lib/stores/server.svelte';
 import {
 	selectedModelName,
@@ -507,6 +508,12 @@ class ChatStore {
 				conversationsStore.activeMessages.slice(0, -1),
 				assistantMessage
 			);
+			// Kemory (WRITE): auto-capture the completed exchange. Fire-and-forget —
+			// captureTurn never throws and no-ops when disabled/disconnected.
+			const finalIdx = conversationsStore.findMessageIndex(assistantMessage.id);
+			const finalAssistant =
+				finalIdx !== -1 ? conversationsStore.activeMessages[finalIdx].content : '';
+			void kemoryStore.captureTurn(content, finalAssistant);
 		} catch (error) {
 			if (isAbortError(error)) {
 				this.setChatLoading(currentConv.id, false);
@@ -536,6 +543,40 @@ class ChatStore {
 		onError?: (error: Error) => void,
 		modelOverride?: string | null
 	): Promise<void> {
+		// Kemory (PULL): deterministically recall relevant memory for the latest user
+		// message and inject it as a system message. Best-effort — buildContextBlock
+		// never throws and returns null when disabled/disconnected/empty, so the turn
+		// proceeds unchanged. Covers every generation path (send, regenerate, branch).
+		let kemoryTopic = '';
+		for (let i = allMessages.length - 1; i >= 0; i--) {
+			if (allMessages[i].role === MessageRole.USER) {
+				kemoryTopic = allMessages[i].content || '';
+				break;
+			}
+		}
+		if (kemoryTopic) {
+			const memoryBlock = await kemoryStore.buildContextBlock(kemoryTopic);
+			if (memoryBlock) {
+				const memoryMessage: DatabaseMessage = {
+					id: 'kemory-context',
+					convId: assistantMessage.convId,
+					type: MessageType.TEXT,
+					timestamp: Date.now(),
+					role: MessageRole.SYSTEM,
+					content: memoryBlock,
+					parent: null,
+					children: []
+				};
+				// Insert after an existing leading system prompt, else at the front.
+				const insertAt = allMessages[0]?.role === MessageRole.SYSTEM ? 1 : 0;
+				allMessages = [
+					...allMessages.slice(0, insertAt),
+					memoryMessage,
+					...allMessages.slice(insertAt)
+				];
+			}
+		}
+
 		let effectiveModel = modelOverride;
 
 		if (isRouterMode() && !effectiveModel) {
